@@ -69,8 +69,8 @@ class config : public paxos_change {
   std::map<std::string, epochState> registry;
   std::map<std::string, epochView> epochViews;
   std::map<std::string, epochView> oldEpochViews;
-  pthread_cond_t roundTrip_cond;
-  pthread_cond_t getEpoch_cond;
+  pthread_cond_t roundTripCond;
+  pthread_cond_t getEpochCond;
   epochState maxState(epochState &st1, epochState &st2);
   bool stateLess(epochState &st1, epochState &st2);
   bool stateLessOrEqual(epochState &st1, epochState &st2);

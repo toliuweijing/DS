@@ -87,8 +87,8 @@ config::config(std::string _first, std::string _me, config_view_change *_vc)
   refreshNum = seqNum = readNum = 0;
   statusMsgCount = ackMsgCount = epochCount = 0;
   lastReadStartTime = lastCompletedReadStartTime = epochStartTime = 0;
-  VERIFY(pthread_cond_init(&roundTrip_cond, NULL) == 0);
-  VERIFY(pthread_cond_init(&getEpoch_cond, NULL) == 0);
+  VERIFY(pthread_cond_init(&roundTripCond, NULL) == 0);
+  VERIFY(pthread_cond_init(&getEpochCond, NULL) == 0);
 
   {
       ScopedLock ml(&cfg_mutex);
@@ -389,7 +389,7 @@ void config::refresh() {
     next_timeout.tv_nsec = 0;
     tprintf("roundTripTimer turned on\n");
     int roundTripTimerRes =
-        pthread_cond_timedwait(&roundTrip_cond, &cfg_mutex, &next_timeout);
+        pthread_cond_timedwait(&roundTripCond, &cfg_mutex, &next_timeout);
     if (roundTripTimerRes == ETIMEDOUT) {
       roundTripTimeOut();
     }
@@ -483,7 +483,7 @@ void config::getEpochWithTimer() {
     next_timeout.tv_nsec = 0;
     tprintf("roundTripTimer turned on\n");
     int getEpochTimerRes =
-        pthread_cond_timedwait(&roundTrip_cond, &cfg_mutex, &next_timeout);
+        pthread_cond_timedwait(&roundTripCond, &cfg_mutex, &next_timeout);
     if (getEpochTimerRes == ETIMEDOUT) {
       // getEpochTimer timeout
       ++seqNum;
@@ -581,6 +581,7 @@ paxos_protocol::status config::collectReq(std::string src, unsigned rn) {
 
 paxos_protocol::status config::statusReq(std::string src, unsigned rn, std::map<std::string, epochState> srcReg) {
   pthread_mutex_lock(&cfg_mutex);
+  if (rn == readNum) {
   std::map<std::string, epochView>::iterator it;
   for (it = epochViews.begin(); it != epochViews.end(); ++it) {
     (*it).second.state = maxState((*it).second.state, srcReg[(*it).first]);
@@ -612,6 +613,7 @@ paxos_protocol::status config::statusReq(std::string src, unsigned rn, std::map<
     }
     leader = leaderEpoch.id;
     // start readTimer with delta+theta time units;
+  }
   }
   pthread_mutex_unlock(&cfg_mutex);
   return paxos_protocol::OK;
