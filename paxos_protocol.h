@@ -17,6 +17,12 @@ class paxos_protocol {
     acceptreq,
     decidereq,
     heartbeat,
+    refreshReq,
+    ackReq,
+    getEpochNumReq,
+    retEpochNumReq,
+    collectReq,
+    statusReq,
   };
 
   struct preparearg {

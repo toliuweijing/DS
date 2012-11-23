@@ -49,10 +49,11 @@ class config : public paxos_change {
   unsigned int epochStartTime;
   unsigned int delta;
   unsigned int theta;
+  std::string leader;
   bool isLeader;
   struct epochNum {
     unsigned serialNum;
-    std::string pid;
+    std::string id;
   };
   epochNum globalMaxEn;
   epochNum localMaxEn;
@@ -70,6 +71,11 @@ class config : public paxos_change {
   std::map<std::string, epochView> oldEpochViews;
   pthread_cond_t roundTrip_cond;
   pthread_cond_t getEpoch_cond;
+  epochState maxState(epochState &st1, epochState &st2);
+  bool stateLess(epochState &st1, epochState &st2);
+  bool stateLessOrEqual(epochState &st1, epochState &st2);
+  bool epochLess(epochNum &en1, epochNum &en2);
+  bool epochLessOrEqual(epochNum &en1, epochNum &en2);
 
  public:
   config(std::string _first, std::string _me, config_view_change *_vc);
@@ -88,20 +94,28 @@ class config : public paxos_change {
   /* Leader election */
   // Refresh
   void refresh();
+  void sendRefresh(std::string target);
   paxos_protocol::status refreshReq(std::string src, epochState rg, unsigned rn);
   paxos_protocol::status ackReq(std::string src, unsigned rn);
   // Advance epoch
   void roundTripTimeOut();
-  void getEpochTimeOut();
+  void sendGetEpochNum(std::string target);
+  void getEpochWithTimer();
   paxos_protocol::status getEpochNumReq(std::string src, unsigned sn);
-  paxos_protocol::status retEpochNumReq(std::string src, unsigned sn);
+  paxos_protocol::status retEpochNumReq(std::string src, unsigned sn, epochNum en);
   // Collect
   void readTimeOut();
+  void sendCollect(std::string target);
   paxos_protocol::status collectReq(std::string src, unsigned rn);
   paxos_protocol::status statusReq(std::string src, unsigned rn,
       std::map<std::string, epochState> srcReg);
   // Become leader
   void becomeLeader();
+};
+
+struct threadStruct {
+  config* cfg;
+  std::string target;
 };
 
 #endif

@@ -39,6 +39,19 @@
 // all views, the other nodes can bring this re-joined node up to
 // date.
 
+/*
+bool
+operator> (const _t &a, const prop_t &b)
+{
+  return (a.n > b.n || (a.n == b.n && a.m > b.m));
+}
+
+bool
+operator>= (const prop_t &a, const prop_t &b)
+{
+  return (a.n > b.n || (a.n == b.n && a.m >= b.m));
+}
+*/
 static void *
 heartbeatthread(void *x)
 {
@@ -62,6 +75,20 @@ config::config(std::string _first, std::string _me, config_view_change *_vc)
   // XXX hack; maybe should have its own port number
   pxsrpc = acc->get_rpcs();
   pxsrpc->reg(paxos_protocol::heartbeat, this, &config::heartbeat);
+  
+  // Leader election
+  registry[me].en.serialNum = 0;
+  registry[me].en.id = me;
+  registry[me].freshness = 0;
+  epochViews[me].state = registry[me];
+  epochViews[me].expired = true;
+  isLeader = false;
+  delta = theta = 3;
+  refreshNum = seqNum = readNum = 0;
+  statusMsgCount = ackMsgCount = epochCount = 0;
+  lastReadStartTime = lastCompletedReadStartTime = epochStartTime = 0;
+  VERIFY(pthread_cond_init(&roundTrip_cond, NULL) == 0);
+  VERIFY(pthread_cond_init(&getEpoch_cond, NULL) == 0);
 
   {
       ScopedLock ml(&cfg_mutex);
@@ -328,5 +355,321 @@ config::doheartbeat(std::string m)
   }
   tprintf("doheartbeat done %d\n", res);
   return res;
+}
+
+// Leader election
+
+static void* sendRefreshThread (void* x) {
+  threadStruct* r = (threadStruct*) x;
+  r->cfg->sendRefresh(r->target);
+  pthread_exit(NULL);
+}
+
+void config::refresh() {
+  timeval now;
+  timespec next_timeout;
+  while(1) {
+    // Upon refreshTimer timeout.
+    VERIFY(pthread_mutex_lock(&cfg_mutex)==0);
+    ackMsgCount = 0;
+    ++refreshNum;
+    int rc;
+    pthread_t threads[mems.size()];
+    for (unsigned i = 0; i < mems.size(); ++i) {
+      threadStruct ts;
+      ts.cfg = this;
+      ts.target = mems[i];
+      rc = pthread_create(&threads[i], NULL, sendRefreshThread, (void*) &ts);
+      if (rc) {
+        printf("ERROR; return code from pthread_create() is %d\n", rc);
+      }
+    } 
+    gettimeofday(&now, NULL);
+    next_timeout.tv_sec = now.tv_sec + theta;
+    next_timeout.tv_nsec = 0;
+    tprintf("roundTripTimer turned on\n");
+    int roundTripTimerRes =
+        pthread_cond_timedwait(&roundTrip_cond, &cfg_mutex, &next_timeout);
+    if (roundTripTimerRes == ETIMEDOUT) {
+      roundTripTimeOut();
+    }
+    
+    
+  }
+}
+
+void config::sendRefresh(std::string target) {
+  VERIFY(pthread_mutex_lock(&cfg_mutex)==0);
+  handle h(target);
+  VERIFY(pthread_mutex_unlock(&cfg_mutex)==0);
+  rpcc* cl = h.safebind();
+  if (cl) {
+    //cl->call(paxos_protocol::refreshReq, me, registry[me], refreshNum);
+  }
+}
+
+paxos_protocol::status config::refreshReq(std::string src, epochState rg, unsigned rn) {
+  pthread_mutex_lock(&cfg_mutex);
+  if (registry[src].en.serialNum < rg.en.serialNum ||
+      (registry[src].en.serialNum == rg.en.serialNum && registry[src].en.id < rg.en.id) ||
+      (registry[src].en.serialNum == rg.en.serialNum && registry[src].en.id == rg.en.id && registry[src].freshness < rg.freshness)) {
+    registry[src] = rg;
+    handle h(src);
+    pthread_mutex_unlock(&cfg_mutex);
+    rpcc* cl = h.safebind();
+    if (cl) {
+      //cl->call(paxos_protocol::ackReq, me, rn);
+    }
+  }
+  return paxos_protocol::OK;
+} 
+
+paxos_protocol::status config::ackReq(std::string src, unsigned rn) {
+  pthread_mutex_lock(&cfg_mutex);
+  if (++ackMsgCount >= ((mems.size() >> 1) + 1)) {
+    // stop roundTripTimer
+    ++(registry[me].freshness);
+  }
+  pthread_mutex_unlock(&cfg_mutex);
+  return paxos_protocol::OK;
+}
+
+static void* sendGetEpochNumThread(void* x) {
+  threadStruct* r = (threadStruct*) x;
+  r->cfg->sendGetEpochNum(r->target);
+  pthread_exit(NULL);
+}
+
+// Assume cfg_mutex is held when calling this function.
+void config::roundTripTimeOut() {
+  // stop refreshtimer.
+  ++refreshNum;
+  isLeader = false;
+  epochViews[me].expired = true;
+  epochCount = 0;
+  globalMaxEn = registry[me].en;
+  ++seqNum;
+  getEpochWithTimer();
+}
+
+void config::sendGetEpochNum(std::string target) {
+  VERIFY(pthread_mutex_lock(&cfg_mutex)==0);
+  handle h(target);
+  VERIFY(pthread_mutex_unlock(&cfg_mutex)==0);
+  rpcc* cl = h.safebind();
+  if (cl) {
+    //cl->call(paxos_protocol::getEpochNumReq, me, registry[me], refreshNum);
+  }
+}
+
+// Assume cfg_mutex is held when calling this function.
+void config::getEpochWithTimer() {
+  timeval now;
+  timespec next_timeout;
+  int rc;
+  pthread_t threads[mems.size()];
+  while (1) {
+    for (unsigned i = 0; i < mems.size(); ++i) {
+      threadStruct ts;
+      ts.cfg = this;
+      ts.target = mems[i];
+      rc = pthread_create(&threads[i], NULL, sendGetEpochNumThread, (void*) &ts);
+      if (rc) {
+        tprintf("ERROR; return code from pthread_create() is %d\n", rc);
+      }
+    } 
+    gettimeofday(&now, NULL);
+    next_timeout.tv_sec = now.tv_sec + theta;
+    next_timeout.tv_nsec = 0;
+    tprintf("roundTripTimer turned on\n");
+    int getEpochTimerRes =
+        pthread_cond_timedwait(&roundTrip_cond, &cfg_mutex, &next_timeout);
+    if (getEpochTimerRes == ETIMEDOUT) {
+      // getEpochTimer timeout
+      ++seqNum;
+      epochCount = 0;
+      globalMaxEn = registry[me].en;
+      continue;
+    } else if (getEpochTimerRes == 0) {
+      break;
+    }
+  }
+}
+
+paxos_protocol::status config::getEpochNumReq(std::string src, unsigned sn) {
+  pthread_mutex_lock(&cfg_mutex);
+  std::map<std::string, epochState>::iterator it = registry.begin();
+  localMaxEn = (*it).second.en;
+  for (++it; it != registry.end(); ++it) {
+    if ((*it).second.en.serialNum > localMaxEn.serialNum ||
+        ((*it).second.en.serialNum == localMaxEn.serialNum && (*it).second.en.id > localMaxEn.id)) {
+      localMaxEn = (*it).second.en;
+  }
+  handle h(src);
+  pthread_mutex_unlock(&cfg_mutex);
+  rpcc *cl = h.safebind();
+    if (cl) {
+    //cl->call(paxos_protocol::retEpochNumReq, me, sn, localMaxEn); 
+    }
+  }
+  return paxos_protocol::OK;
+}
+
+paxos_protocol::status config::retEpochNumReq(std::string src, unsigned sn, epochNum en) {
+  pthread_mutex_lock(&cfg_mutex);
+  if (sn == seqNum) {
+    if (en.serialNum > globalMaxEn.serialNum ||
+        (en.serialNum == globalMaxEn.serialNum && en.id > globalMaxEn.id)) {
+      globalMaxEn = en;
+    }
+    if (++epochCount >= ((mems.size() >> 1) + 1)) {
+      registry[me].en.serialNum = globalMaxEn.serialNum + 1;
+      epochStartTime = time(NULL);
+      // start refreshTimer
+    }
+  }
+  pthread_mutex_unlock(&cfg_mutex);
+  return paxos_protocol::OK;
+}
+
+static void* sendCollectThread(void* x) {
+  threadStruct* r = (threadStruct*) x;
+  r->cfg->sendCollect(r->target);
+  pthread_exit(NULL);
+}
+
+void config::readTimeOut() {
+  pthread_mutex_lock(&cfg_mutex);
+  lastReadStartTime = time(NULL);
+  ++readNum;
+  statusMsgCount = 0;
+  oldEpochViews = epochViews;
+  int rc;
+  pthread_t threads[mems.size()];
+  for (unsigned i = 0; i < mems.size(); ++i) {
+    threadStruct ts;
+    ts.cfg = this;
+    ts.target = mems[i];
+    rc = pthread_create(&threads[i], NULL, sendCollectThread, (void*) &ts);
+    if (rc) {
+      tprintf("ERROR; return code from pthread_create() is %d\n", rc);
+    }
+  } 
+  pthread_mutex_unlock(&cfg_mutex);
+}
+
+void config::sendCollect(std::string target) {
+  pthread_mutex_lock(&cfg_mutex);
+  handle h(target);
+  pthread_mutex_unlock(&cfg_mutex);
+  rpcc* cl = h.safebind();
+  if (cl) {
+    //cl->(paxos_protocol::collectReq, me, readNum);
+  }
+}
+
+paxos_protocol::status config::collectReq(std::string src, unsigned rn) {
+  pthread_mutex_lock(&cfg_mutex);
+  handle h(src);
+  pthread_mutex_unlock(&cfg_mutex);
+  rpcc* cl = h.safebind();
+  if (cl) {
+    //cl->call(paxos_protocol::statusReq, me, rn, registry);
+  } 
+  return paxos_protocol::OK;
+}
+
+paxos_protocol::status config::statusReq(std::string src, unsigned rn, std::map<std::string, epochState> srcReg) {
+  pthread_mutex_lock(&cfg_mutex);
+  std::map<std::string, epochView>::iterator it;
+  for (it = epochViews.begin(); it != epochViews.end(); ++it) {
+    (*it).second.state = maxState((*it).second.state, srcReg[(*it).first]);
+  }
+  if (++statusMsgCount >= ((mems.size() >> 1) + 1)) {
+    lastCompletedReadStartTime = lastReadStartTime;
+    for (it = epochViews.begin(); it != epochViews.end(); ++it) {
+      if (stateLessOrEqual((*it).second.state, oldEpochViews[(*it).first].state)) {
+        (*it).second.expired = true;
+      }
+      if (epochLess(oldEpochViews[(*it).first].state.en, (*it).second.state.en)) {
+        (*it).second.expired = false;
+      }
+    }
+    
+    bool inited = false;
+    epochNum minEpoch; 
+    for (it = epochViews.begin(); it != epochViews.end(); ++it) {
+      if ((!(*it).second.expired && !inited) ||
+          (!(*it).second.expired && epochLess((*it).second.state.en, minEpoch))) {
+        minEpoch = (*it).second.state.en;
+      }
+  }
+    if (inited) {
+      leaderEpoch = minEpoch;
+    } else {
+      leaderEpoch.serialNum = 0;
+      (leaderEpoch.id) = "";
+    }
+    leader = leaderEpoch.id;
+    // start readTimer with delta+theta time units;
+  }
+  pthread_mutex_unlock(&cfg_mutex);
+  return paxos_protocol::OK;
+}
+
+config::epochState config::maxState(epochState &st1, epochState &st2) {
+  if (stateLess(st1, st2)) {
+    return st2;
+  } else {
+    return st1;
+  }
+}
+
+bool config::epochLess(config::epochNum &en1, config::epochNum &en2) {
+  if (en1.serialNum < en2.serialNum ||
+      (en1.serialNum == en2.serialNum && en1.id < en2.id)) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+bool config::epochLessOrEqual(config::epochNum &en1, config::epochNum &en2) {
+  if (en1.serialNum <= en2.serialNum ||
+      (en1.serialNum == en2.serialNum && en1.id <= en2.id)) {
+    return true;
+  } else {
+    return false;
+  }
+}
+bool config::stateLess(epochState &st1, epochState &st2) {
+  if (st1.en.serialNum < st2.en.serialNum ||
+      (st1.en.serialNum == st2.en.serialNum && st1.en.id < st2.en.id) ||
+      (st1.en.serialNum == st2.en.serialNum && st1.en.id == st2.en.id && st1.freshness < st2.freshness)) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+bool config::stateLessOrEqual(epochState &st1, epochState &st2) {
+  if (st1.en.serialNum <= st2.en.serialNum ||
+      (st1.en.serialNum == st2.en.serialNum && st1.en.id <= st2.en.id) ||
+      (st1.en.serialNum == st2.en.serialNum && st1.en.id == st2.en.id && st1.freshness <= st2.freshness)) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+void config::becomeLeader() {
+  // Upon change to lastCompletedReadStartTime.
+  pthread_mutex_lock(&cfg_mutex);
+  if ((leaderEpoch.serialNum == registry[me].en.serialNum &&
+      leaderEpoch.id == registry[me].en.id) &&
+      (lastCompletedReadStartTime - epochStartTime) >= 2 * delta + 3 * theta) {
+    isLeader = true;
+  }
+  pthread_mutex_unlock(&cfg_mutex);
 }
 
